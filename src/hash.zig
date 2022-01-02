@@ -1,73 +1,76 @@
 const std = @import("std");
 
-pub const Hash = struct {
-    const This = @This();
+pub fn Hash(
+    comptime Context: type,
+    comptime digest_length: u8,
+    comptime hashFn: fn ([]const u8, *[digest_length]u8) void,
+    comptime updateFn: fn (Context, []const u8) void,
+    comptime finalFn: fn (Context, *[digest_length]u8) void,
+    comptime resetFn: fn (Context) void,
+) type {
+    return struct {
+        const This = @This();
 
-    impl: *anyopaque,
-    initFn: fn (*anyopaque) void,
-    hashFn: fn ([]const u8, []u8) void,
-    updateFn: fn (*anyopaque, []const u8) void,
-    finalFn: fn (*anyopaque, []u8) void,
+        context: Context,
 
-    digest_length: u8,
+        pub const digest_length = digest_length;
 
-    pub fn init(iface: *const This) void {
-        iface.initFn(iface.impl);
+        pub fn hash(b: []const u8, out: *[digest_length]u8) void {
+            return hashFn(b, out);
+        }
+
+        pub fn update(this: This, b: []const u8) void {
+            return updateFn(this.context, b);
+        }
+
+        pub fn final(this: This, out: *[digest_length]u8) void {
+            return finalFn(this.context, out);
+        }
+
+        pub fn reset(this: This) void {
+            return resetFn(this.context);
+        }
+    };
+}
+
+pub fn isHash(comptime T: type) void {
+    comptime {
+        if (!(std.meta.trait.multiTrait(.{
+            std.meta.trait.hasFn("hash"),
+            std.meta.trait.hasFn("update"),
+            std.meta.trait.hasFn("final"),
+            std.meta.trait.hasFn("reset"),
+        })(T) and std.meta.trait.hasDecls(T, .{"digest_length"}))) @compileError("Hash type doesn't implement the interface correctly");
     }
-
-    pub fn hash(iface: *const This, b: []const u8, out: []u8) void {
-        return iface.hashFn(b, out);
-    }
-
-    pub fn update(iface: *const This, b: []const u8) void {
-        return iface.updateFn(iface.impl, b);
-    }
-
-    pub fn final(iface: *const This, out: []u8) void {
-        return iface.finalFn(iface.impl, out);
-    }
-};
+}
 
 pub const Sha1 = struct {
     const This = @This();
 
-    hash: std.crypto.hash.Sha1 = std.crypto.hash.Sha1.init(.{}),
+    const digest_length = std.crypto.hash.Sha1.digest_length;
 
-    pub fn init() This {
-        return This{};
+    pub const HashType = Hash(*This, digest_length, hashFn, updateFn, finalFn, resetFn);
+
+    h: std.crypto.hash.Sha1 = std.crypto.hash.Sha1.init(.{}),
+
+    pub fn hash(this: *This) HashType {
+        return .{ .context = this };
     }
 
-    pub fn interface(this: *This) Hash {
-        return .{
-            .impl = @ptrCast(*anyopaque, this),
-            .initFn = initFn,
-            .hashFn = hashFn,
-            .updateFn = updateFn,
-            .finalFn = finalFn,
-            .digest_length = std.crypto.hash.Sha1.digest_length,
-        };
+    fn hashFn(b: []const u8, out: *[digest_length]u8) void {
+        std.crypto.hash.Sha1.hash(b, out, .{});
     }
 
-    fn initFn(this_anyopaque: *anyopaque) void {
-        var this = @ptrCast(*This, @alignCast(@alignOf(This), this_anyopaque));
-
-        this.hash = std.crypto.hash.Sha1.init(.{});
+    fn updateFn(this: *This, b: []const u8) void {
+        return this.h.update(b);
     }
 
-    fn hashFn(b: []const u8, out: []u8) void {
-        std.crypto.hash.Sha1.hash(b, out[0..std.crypto.hash.Sha1.digest_length], .{});
+    fn finalFn(this: *This, out: *[digest_length]u8) void {
+        return this.h.final(out);
     }
 
-    fn updateFn(this_anyopaque: *anyopaque, b: []const u8) void {
-        var this = @ptrCast(*This, @alignCast(@alignOf(This), this_anyopaque));
-
-        return this.hash.update(b);
-    }
-
-    fn finalFn(this_anyopaque: *anyopaque, out: []u8) void {
-        var this = @ptrCast(*This, @alignCast(@alignOf(This), this_anyopaque));
-
-        return this.hash.final(out[0..std.crypto.hash.Sha1.digest_length]);
+    fn resetFn(this: *This) void {
+        this.h = std.crypto.hash.Sha1.init(.{});
     }
 };
 
