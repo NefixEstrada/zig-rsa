@@ -10,6 +10,7 @@ const Class = enum(u8) {
 };
 
 const Tag = enum(u8) {
+    Bool = 1,
     Integer = 2,
     BitString = 3,
     OctetString = 4,
@@ -142,6 +143,13 @@ const Token = union(enum) {
     //     Short: u8,
     //     Long: struct { additional_octets: u8 },
     // },
+    Bool: struct {
+        len: usize,
+
+        pub fn slice(self: @This(), buf: []const u8, i: usize) []const u8 {
+            return buf[i - self.len .. i];
+        }
+    },
     Integer: struct {
         len: usize,
 
@@ -157,6 +165,14 @@ const Token = union(enum) {
             return buf[i - self.len .. i];
         }
     },
+    Sequence: struct {
+        len: usize,
+        // child: []*Token,
+
+        pub fn slice(self: @This(), buf: []const u8, i: usize) []const u8 {
+            return buf[i - self.len .. i];
+        }
+    },
 };
 
 const TokenParser = struct {
@@ -164,6 +180,7 @@ const TokenParser = struct {
 
     state: State,
     complete: bool,
+    repeat_byte: bool,
     skip_bytes: usize,
 
     class: ?Class,
@@ -183,12 +200,14 @@ const TokenParser = struct {
     pub fn reset(this: *This) void {
         this.state = .Identifier;
         this.complete = false;
+        this.repeat_byte = false;
         this.skip_bytes = 0;
 
         this.class = null;
         this.is_primitive = false;
         this.tag = null;
 
+        this.length = 0;
         this.length_long_accumulated = 0;
         this.integer_seen_most_significant_bit = false;
     }
@@ -196,8 +215,12 @@ const TokenParser = struct {
     pub const State = enum {
         Identifier,
         Length,
+        LongLength,
+        FinishedLength,
+        Bool,
         Integer,
         ObjectIdentifier,
+        Sequence,
     };
 
     pub const Error = error{
@@ -229,18 +252,45 @@ const TokenParser = struct {
                 // Sxxxxxxx
                 if (c & 0b10000000 != 0b10000000) {
                     this.length = c & 0b01111111;
-                } else {
-                    @panic("not supported yet!");
-                    // token.* = .{ .Length = .{
-                    //     .Long = .{ .additional_octets = c & 0b01111111 },
-                    // } };
-                }
 
+                    this.state = .FinishedLength;
+                } else {
+                    this.length_long_accumulated = c & 0b01111111;
+                    this.state = .LongLength;
+                }
+            },
+            .LongLength => {
+                this.length <<= 8;
+                this.length |= c;
+
+                this.length_long_accumulated -= 1;
+
+                if (this.length_long_accumulated == 0) {
+                    this.state = .FinishedLength;
+                }
+            },
+            .FinishedLength => {
                 switch (this.tag.?) {
+                    .Bool => this.state = .Bool,
                     .Integer => this.state = .Integer,
                     .ObjectIdentifier => this.state = .ObjectIdentifier,
+                    .Sequence => this.state = .Sequence,
                     else => @panic("unsupported tag"),
                 }
+
+                // since this state doesn't read bytes, don't count this iteration
+                this.repeat_byte = true;
+            },
+            .Bool => {
+                token.* = .{
+                    .Bool = .{
+                        .len = this.length,
+                    },
+                };
+
+                // length - 1, since the first octet has been just read
+                this.skip_bytes = this.length - 1;
+                this.complete = true;
             },
             .Integer => {
                 if (this.integer_seen_most_significant_bit) {
@@ -258,6 +308,15 @@ const TokenParser = struct {
                         .first_values = c,
                     },
                 };
+                // length - 1, since the first octet has been just read
+                this.skip_bytes = this.length - 1;
+                this.complete = true;
+            },
+            .Sequence => {
+                token.* = .{ .Sequence = .{
+                    .len = this.length,
+                } };
+
                 // length - 1, since the first octet has been just read
                 this.skip_bytes = this.length - 1;
                 this.complete = true;
@@ -296,7 +355,13 @@ pub const TokenStream = struct {
 
         while (this.i < this.buf.len) {
             try this.parser.feed(this.buf[this.i], &t);
-            this.i += 1;
+
+            if (!this.parser.repeat_byte) {
+                this.i += 1;
+            } else {
+                this.parser.repeat_byte = false;
+            }
+
             if (this.parser.skip_bytes != 0) {
                 this.i += this.parser.skip_bytes;
                 this.parser.skip_bytes = 0;
@@ -378,11 +443,14 @@ fn ParseInternalErrorImpl(comptime T: type, comptime inferred_types: []const typ
     }
 
     switch (@typeInfo(T)) {
+        .Bool => {
+            return error{ UnexpectedToken, InvalidBoolean };
+        },
         .Int, .ComptimeInt => {
             return error{ UnexpectedToken, Overflow, IntTooLarge };
         },
         .Struct => {
-            return error{};
+            return error{UnexpectedToken};
         },
         else => @compileLog("unsupported type: ", T),
     }
@@ -392,11 +460,11 @@ fn ParseInternalErrorImpl(comptime T: type, comptime inferred_types: []const typ
 
 pub const ParseOptions = struct {
     allocator: ?std.mem.Allocator = null,
-    skip_identifier: false,
+    skip_identifier: bool = false,
 };
 
 fn parseInternal(comptime T: type, token: Token, tokens: *TokenStream, options: ParseOptions) ParseInternalError(T)!T {
-    const token = if (!options.skip_identifier) {} else undefined;
+    // const token = if (!options.skip_identifier) {} else undefined;
 
     switch (T) {
         ObjectIdentifier => {
@@ -485,6 +553,22 @@ fn parseInternal(comptime T: type, token: Token, tokens: *TokenStream, options: 
     }
 
     switch (@typeInfo(T)) {
+        .Bool => {
+            const bool_token = switch (token) {
+                .Bool => |b| b,
+                else => return error.UnexpectedToken,
+            };
+
+            if (bool_token.len > 1) {
+                return error.InvalidBoolean;
+            }
+
+            switch (bool_token.slice(tokens.buf, tokens.i)[0]) {
+                0x00 => return false,
+                0xff => return true,
+                else => return error.InvalidBoolean,
+            }
+        },
         .Int, .ComptimeInt => {
             const int_token = switch (token) {
                 .Integer => |i| i,
@@ -517,6 +601,22 @@ fn parseInternal(comptime T: type, token: Token, tokens: *TokenStream, options: 
                 else => return error.IntTooLarge,
             }
         },
+        .Struct => |struct_info| {
+            const struct_token = switch (token) {
+                .Sequence => |s| s,
+                else => return error.UnexpectedToken,
+            };
+
+            var r: T = undefined;
+            // var fields_seen = [_]bool{false} ** struct_info.fields.len;
+
+            inline for (struct_info.fields) |struct_field| {
+                // TODO: if (internal_fields.i == 0 and struct_field.field_type == RawContent) {
+                // TODO: This should be done inside the token stream and added inside the token, not parsing again...
+                var stream = TokenStream.init(struct_token.slice(tokens.buf, tokens.i));
+                @field(r, struct_field.name) = try parse(struct_field.field_type, &stream, options);
+            }
+        },
         else => @panic("unsupported type!"),
     }
 }
@@ -542,12 +642,54 @@ pub fn parseFree(comptime T: type, value: T, options: ParseOptions) void {
             const allocator = options.allocator orelse unreachable;
             allocator.free(value.object_identifier);
         },
+        bool => {},
         else => @panic("not implemented"),
     }
 }
 
+test "parse bool" {
+    const TestParseBool = struct {
+        in: []const u8,
+        out: bool,
+        ok: bool,
+    };
+    const testParseBoolData = [_]TestParseBool{ .{
+        .in = &.{ 0b00000001, 0b00000001, 0x00, 0b00000000 },
+        .out = false,
+        .ok = true,
+    }, .{
+        .in = &.{ 0b00000001, 0b00000001, 0xff, 0b00000000 },
+        .out = true,
+        .ok = true,
+    }, .{ .in = &.{ 0b00000001, 0b00000010, 0x00, 0x00, 0b00000000 }, .out = false, .ok = false }, .{ .in = &.{ 0b00000001, 0b00000010, 0xff, 0xff, 0b00000000 }, .out = false, .ok = false }, .{ .in = &.{ 0b00000001, 0b00000001, 0x01, 0b00000000 }, .out = false, .ok = false } };
+
+    for (testParseBoolData) |t| {
+        var stream = TokenStream.init(t.in);
+        const res = parse(bool, &stream, .{ .allocator = std.testing.allocator }) catch |err| {
+            if (t.ok) {
+                return err;
+            }
+
+            continue;
+        };
+        defer parseFree(bool, res, .{ .allocator = std.testing.allocator });
+
+        std.testing.expect(t.ok) catch |err| {
+            std.debug.print("expecting test to fail, but got: {d}\n", .{res});
+            return err;
+        };
+        std.testing.expect(t.out == res) catch |err| {
+            std.debug.print("in: {b}\n", .{t.in});
+            std.debug.print("expecting: {d}\n", .{t.out});
+            std.debug.print("found: {d}\n", .{res});
+
+            return err;
+        };
+    }
+}
+
 test "parse int" {
-    var stream = TokenStream.init(&[_]u8{ 0x02, 0x00, 0x02, 0x02, 0x01, 0x00 });
+    var stream = TokenStream.init(&[_]u8{ 0b00000010, 0x00, 0x02, 0x02, 0x01, 0b00000000 });
     const res = try parse(i16, &stream, .{});
 
     try std.testing.expectEqual(@as(i16, 256), res);
@@ -621,12 +763,12 @@ test "parse object identifier" {
     }
 }
 
-// test "parse RSA" {
-//     var stream = TokenStream.init(&[_]u8{ 0x06, 0x06, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d });
-//     const res = try parse(ObjectIdentifier, &stream, .{ .allocator = std.testing.allocator });
-//     defer std.testing.allocator.free(res.object_identifier);
+test "parse RSA" {
+    var stream = TokenStream.init(&[_]u8{ 0x06, 0x06, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d });
+    const res = try parse(ObjectIdentifier, &stream, .{ .allocator = std.testing.allocator });
+    defer std.testing.allocator.free(res.object_identifier);
 
-//     var expected = [_]i32{ 1, 2, 840, 113549 };
+    var expected = [_]i32{ 1, 2, 840, 113549 };
 
-//     try std.testing.expectEqualSlices(i32, expected[0..], res.object_identifier);
-// }
+    try std.testing.expectEqualSlices(i32, expected[0..], res.object_identifier);
+}
