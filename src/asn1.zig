@@ -157,6 +157,13 @@ const Token = union(enum) {
             return buf[i - self.len .. i];
         }
     },
+    BitString: struct {
+        len: usize,
+
+        pub fn slice(self: @This(), buf: []const u8, i: usize) []const u8 {
+            return buf[i - self.len .. i];
+        }
+    },
     ObjectIdentifier: struct {
         len: usize,
         first_values: u8,
@@ -219,6 +226,7 @@ const TokenParser = struct {
         FinishedLength,
         Bool,
         Integer,
+        BitString,
         ObjectIdentifier,
         Sequence,
     };
@@ -273,6 +281,7 @@ const TokenParser = struct {
                 switch (this.tag.?) {
                     .Bool => this.state = .Bool,
                     .Integer => this.state = .Integer,
+                    .BitString => this.state = .BitString,
                     .ObjectIdentifier => this.state = .ObjectIdentifier,
                     .Sequence => this.state = .Sequence,
                     else => @panic("unsupported tag"),
@@ -300,6 +309,19 @@ const TokenParser = struct {
                 } else {
                     this.integer_seen_most_significant_bit = true;
                 }
+            },
+            .BitString => {
+                token.* = .{ .BitString = .{
+                    .len = this.length,
+                } };
+
+                // This if is required, since BitString can be zero length
+                if (this.length > 0) {
+                    // length - 1, since the first octet has been just read
+                    this.skip_bytes = this.length - 1;
+                }
+
+                this.complete = true;
             },
             .ObjectIdentifier => {
                 token.* = .{
@@ -430,6 +452,9 @@ fn ParseInternalErrorImpl(comptime T: type, comptime inferred_types: []const typ
     // const CommonErrors = error{ UnexpectedEndOfAsn1, UnexpectedToken };
 
     switch (T) {
+        BitString => {
+            return error{ UnexpectedToken, AllocatorRequired, ZeroLength, InvalidPadding } || std.mem.Allocator.Error;
+        },
         ObjectIdentifier => {
             return error{
                 UnexpectedToken,
@@ -449,8 +474,13 @@ fn ParseInternalErrorImpl(comptime T: type, comptime inferred_types: []const typ
         .Int, .ComptimeInt => {
             return error{ UnexpectedToken, Overflow, IntTooLarge };
         },
-        .Struct => {
-            return error{UnexpectedToken};
+        .Struct => |struct_info| {
+            var err = error{UnexpectedToken};
+            inline for (struct_info.fields) |struct_field| {
+                err = err || ParseInternalError(struct_field.field_type);
+            }
+
+            return err;
         },
         else => @compileLog("unsupported type: ", T),
     }
@@ -467,6 +497,36 @@ fn parseInternal(comptime T: type, token: Token, tokens: *TokenStream, options: 
     // const token = if (!options.skip_identifier) {} else undefined;
 
     switch (T) {
+        BitString => {
+            const bit_str_token = switch (token) {
+                .BitString => |str| str,
+                else => return error.UnexpectedToken,
+            };
+
+            if (bit_str_token.len == 0) {
+                return error.ZeroLength;
+            }
+
+            const bit_str_buf = bit_str_token.slice(tokens.buf, tokens.i);
+            const padding: u8 = bit_str_buf[0];
+
+            if (padding > 7 or
+                (bit_str_buf.len == 1 and padding > 0) or
+                (bit_str_buf[bit_str_buf.len - 1] & ((@as(u8, 1) << @intCast(u3, padding)) - 1) != 0))
+            {
+                return error.InvalidPadding;
+            }
+
+            const allocator = options.allocator orelse return error.AllocatorRequired;
+            var s = try allocator.alloc(u8, bit_str_buf.len);
+
+            std.mem.copy(u8, s, bit_str_buf[1..]);
+
+            return BitString{
+                .buf = s,
+                .len = (bit_str_buf.len - 1) * 8 - padding,
+            };
+        },
         ObjectIdentifier => {
             const obj_token = switch (token) {
                 .ObjectIdentifier => |obj| obj,
@@ -638,6 +698,10 @@ pub fn parseFree(comptime T: type, value: T, options: ParseOptions) void {
     }
 
     switch (T) {
+        BitString => {
+            const allocator = options.allocator orelse unreachable;
+            allocator.free(value.buf);
+        },
         ObjectIdentifier => {
             const allocator = options.allocator orelse unreachable;
             allocator.free(value.object_identifier);
@@ -653,15 +717,33 @@ test "parse bool" {
         out: bool,
         ok: bool,
     };
-    const testParseBoolData = [_]TestParseBool{ .{
-        .in = &.{ 0b00000001, 0b00000001, 0x00, 0b00000000 },
-        .out = false,
-        .ok = true,
-    }, .{
-        .in = &.{ 0b00000001, 0b00000001, 0xff, 0b00000000 },
-        .out = true,
-        .ok = true,
-    }, .{ .in = &.{ 0b00000001, 0b00000010, 0x00, 0x00, 0b00000000 }, .out = false, .ok = false }, .{ .in = &.{ 0b00000001, 0b00000010, 0xff, 0xff, 0b00000000 }, .out = false, .ok = false }, .{ .in = &.{ 0b00000001, 0b00000001, 0x01, 0b00000000 }, .out = false, .ok = false } };
+    const testParseBoolData = [_]TestParseBool{
+        .{
+            .in = &.{ 0b00000001, 0b00000001, 0x00, 0b00000000 },
+            .out = false,
+            .ok = true,
+        },
+        .{
+            .in = &.{ 0b00000001, 0b00000001, 0xff, 0b00000000 },
+            .out = true,
+            .ok = true,
+        },
+        .{
+            .in = &.{ 0b00000001, 0b00000010, 0x00, 0x00, 0b00000000 },
+            .out = false,
+            .ok = false,
+        },
+        .{
+            .in = &.{ 0b00000001, 0b00000010, 0xff, 0xff, 0b00000000 },
+            .out = false,
+            .ok = false,
+        },
+        .{
+            .in = &.{ 0b00000001, 0b00000001, 0x01, 0b00000000 },
+            .out = false,
+            .ok = false,
+        },
+    };
 
     for (testParseBoolData) |t| {
         var stream = TokenStream.init(t.in);
@@ -693,6 +775,77 @@ test "parse int" {
     const res = try parse(i16, &stream, .{});
 
     try std.testing.expectEqual(@as(i16, 256), res);
+}
+
+test "parse bit string" {
+    const TestParseBitString = struct {
+        in: []const u8,
+        out: []const u8,
+        len: usize,
+        ok: bool,
+    };
+    const testParseBitString = [_]TestParseBitString{
+        .{
+            .in = &.{ 0b00000011, 0b00000000, 0b00000000 },
+            .out = &.{},
+            .len = 0,
+            .ok = false,
+        },
+        .{
+            .in = &.{ 0b00000011, 0b00000001, 0x00, 0b00000000 },
+            .out = &.{},
+            .len = 0,
+            .ok = true,
+        },
+        .{
+            .in = &.{ 0b00000011, 0b00000010, 0x07, 0x00, 0b00000000 },
+            .out = &.{0x00},
+            .len = 1,
+            .ok = true,
+        },
+        .{
+            .in = &.{ 0b00000011, 0b00000010, 0x07, 0x01, 0b00000000 },
+            .out = &.{},
+            .len = 0,
+            .ok = false,
+        },
+        .{
+            .in = &.{ 0b00000011, 0b00000010, 0x07, 0x40, 0b00000000 },
+            .out = &.{},
+            .len = 0,
+            .ok = false,
+        },
+        .{
+            .in = &.{ 0b00000011, 0b00000010, 0x08, 0x00, 0b00000000 },
+            .out = &.{},
+            .len = 0,
+            .ok = false,
+        },
+    };
+
+    for (testParseBitString) |t| {
+        var stream = TokenStream.init(t.in);
+        const res = parse(BitString, &stream, .{ .allocator = std.testing.allocator }) catch |err| {
+            if (t.ok) {
+                return err;
+            }
+
+            continue;
+        };
+        defer parseFree(BitString, res, .{ .allocator = std.testing.allocator });
+
+        std.testing.expect(t.ok) catch |err| {
+            std.debug.print("expecting test to fail, but got: {d}\n", .{res});
+            return err;
+        };
+        std.testing.expect(std.mem.eql(u8, t.out, res.buf) or t.len == res.len) catch |err| {
+            std.debug.print("in: {b}\n", .{t.in});
+            std.debug.print("expecting: {d} - {d}\n", .{ t.len, t.out });
+            std.debug.print("found: {d} - {d}\n", .{ res.len, res.buf });
+
+            return err;
+        };
+    }
 }
 
 test "parse object identifier" {
